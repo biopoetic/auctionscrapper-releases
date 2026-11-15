@@ -1,0 +1,161 @@
+name: mac-update-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      from:
+        description: Release tag containing AuctionScrapper-mac-app.zip
+        required: true
+        type: string
+      to:
+        description: Expected version after updating (optional)
+        required: false
+        type: string
+      notarized:
+        description: The release is notarized (untick for a Developer ID signed, not notarized build)
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - name: Download the app asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FROM: ${{ inputs.from }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/download"
+          gh release download "$FROM" \
+            --repo biopoetic/auctionscrapper-releases \
+            --pattern AuctionScrapper-mac-app.zip \
+            --dir "$RUNNER_TEMP/download" \
+            --clobber
+          mkdir -p "$HOME/Applications"
+          ditto -x -k "$RUNNER_TEMP/download/AuctionScrapper-mac-app.zip" "$HOME/Applications"
+
+      - name: Verify signature, notarization and Gatekeeper
+        env:
+          NOTARIZED: ${{ inputs.notarized }}
+        run: |
+          APP="$HOME/Applications/AuctionScrapper.app"
+          test -x "$APP/Contents/MacOS/auctionscrapper"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -dv --verbose=2 "$APP" 2>&1 | grep -E "Authority=Developer ID Application|TeamIdentifier|Runtime"
+          if [ "$NOTARIZED" = "true" ]; then
+            xcrun stapler validate "$APP"
+            spctl --assess --type execute --verbose=2 "$APP"
+          else
+            # Signed with Developer ID but not notarized: Gatekeeper must reject
+            # it as "Unnotarized Developer ID", and nothing worse.
+            out=$(spctl --assess --type execute --verbose=2 "$APP" 2>&1 || true)
+            echo "$out"
+            echo "$out" | grep -q "Unnotarized Developer ID" || { echo "unexpected Gatekeeper verdict"; exit 1; }
+          fi
+
+      - name: Start the app
+        run: |
+          APP="$HOME/Applications/AuctionScrapper.app"
+          "$APP/Contents/MacOS/auctionscrapper" serve \
+            --addr 127.0.0.1:8795 \
+            --no-first-run \
+            --no-first-collect \
+            --db "$RUNNER_TEMP/t.db" \
+            > "$RUNNER_TEMP/app.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/app.pid"
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8795/healthz >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/app.log"
+          exit 1
+
+      - name: Save dummy password and AI key through the real forms
+        run: |
+          BASE="http://127.0.0.1:8795"
+          page="$(curl -fsS "$BASE/settings")"
+          token="$(printf '%s' "$page" | grep -o 'name="csrf_token" value="[^"]*"' | head -1 | sed 's/.*value="//; s/"$//')"
+          test -n "$token"
+
+          curl -fsS -o /dev/null -X POST "$BASE/sources/nexisauto/settings" \
+            -H "Origin: $BASE" \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            --data-urlencode "csrf_token=$token" \
+            --data-urlencode 'enabled=1' \
+            --data-urlencode 'username=mac-test-user' \
+            --data-urlencode 'password=mac-test-password' \
+            --data-urlencode 'run_at=' \
+            --data-urlencode 'max_pages=3'
+
+          page="$(curl -fsS "$BASE/settings")"
+          printf '%s' "$page" | grep -q 'Lozinka: spremljena'
+          token="$(printf '%s' "$page" | grep -o 'name="csrf_token" value="[^"]*"' | head -1 | sed 's/.*value="//; s/"$//')"
+
+          curl -fsS -o /dev/null -X POST "$BASE/ai/settings" \
+            -H "Origin: $BASE" \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            --data-urlencode "csrf_token=$token" \
+            --data-urlencode 'enabled=1' \
+            --data-urlencode 'provider=deepseek' \
+            --data-urlencode 'base_url=https://api.deepseek.com' \
+            --data-urlencode 'model=deepseek-chat' \
+            --data-urlencode 'api_key=mac-test-dummy-key' \
+            --data-urlencode 'daily_request_limit=200'
+
+          page="$(curl -fsS "$BASE/settings")"
+          printf '%s' "$page" | grep -q 'API ključ: spremljen'
+
+      - name: Optionally update and wait for the new version
+        if: ${{ inputs.to != '' }}
+        env:
+          TO: ${{ inputs.to }}
+        run: |
+          BASE="http://127.0.0.1:8795"
+          page="$(curl -fsS "$BASE/settings")"
+          token="$(printf '%s' "$page" | grep -o 'name="csrf_token" value="[^"]*"' | head -1 | sed 's/.*value="//; s/"$//')"
+          curl -fsS -o /dev/null -X POST "$BASE/update/check" \
+            -H "Origin: $BASE" \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            --data-urlencode "csrf_token=$token"
+          for i in $(seq 1 180); do
+            if curl -fsS "$BASE/healthz" 2>/dev/null | grep -q "auctionscrapper $TO"; then
+              exit 0
+            fi
+            sleep 1
+          done
+          curl -fsS "$BASE/healthz" || true
+          cat "$RUNNER_TEMP/app.log"
+          exit 1
+
+      - name: Quit through the real form
+        run: |
+          BASE="http://127.0.0.1:8795"
+          page="$(curl -fsS "$BASE/")"
+          token="$(printf '%s' "$page" | grep -o 'name="csrf_token" value="[^"]*"' | head -1 | sed 's/.*value="//; s/"$//')"
+          curl -fsS -X POST "$BASE/quit" \
+            -H "Origin: $BASE" \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            --data-urlencode "csrf_token=$token" \
+            | grep -q 'Aplikacija je zatvorena'
+          for i in $(seq 1 30); do
+            if ! pgrep -f "$HOME/Applications/AuctionScrapper.app/Contents/MacOS/auctionscrapper serve" >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/app.log"
+          exit 1
+
+      - name: Upload app log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-log
+          path: ${{ runner.temp }}/app.log
+          if-no-files-found: ignore
